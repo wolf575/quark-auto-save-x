@@ -161,7 +161,7 @@
 ```bash
 docker run -d \
   --name quark-auto-save-x \
-  -p 5005:5005 \
+  -p 127.0.0.1:5005:5005 \
   -v /自定义配置文件的存储目录/quark-auto-save-x/config:/app/config \
   -v /自定义生成文件的存储目录:/media \  # 可选，插件 alist_strm_gen 生成 strm 使用
   --restart unless-stopped \
@@ -176,7 +176,7 @@ services:
     image: x1ao4/quark-auto-save-x:latest
     container_name: quark-auto-save-x
     ports:
-      - 5005:5005
+      - 127.0.0.1:5005:5005
     volumes:
       - /自定义配置文件的存储目录/quark-auto-save-x/config:/app/config
       - /自定义生成文件的存储目录:/media  # 可选，插件 alist_strm_gen 生成 strm 使用

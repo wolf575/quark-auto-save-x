@@ -1325,6 +1325,8 @@ class _HTTPAccessLogFilter(logging.Filter):
 # 无论是否DEBUG模式，都禁用werkzeug的访问日志，只保留ERROR级别以上的日志
 _werkzeug_logger = logging.getLogger("werkzeug")
 _werkzeug_logger.setLevel(logging.ERROR)
+_waitress_logger = logging.getLogger("waitress")
+_waitress_logger.setLevel(logging.ERROR)
 # 将过滤器添加到werkzeug日志记录器，过滤HTTP访问日志
 try:
     _werkzeug_logger.addFilter(_HTTPAccessLogFilter())
@@ -10004,4 +10006,15 @@ if __name__ == "__main__":
         pass
     # 初始化全局db对象，确保所有接口可用
     record_db = RecordDB()
-    app.run(debug=DEBUG, host="0.0.0.0", port=PORT)
+    if os.environ.get("FLASK_DEV", "false").lower() == "true":
+        app.run(debug=DEBUG, host="0.0.0.0", port=PORT)
+    else:
+        from waitress import serve
+
+        serve(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            threads=8,
+            channel_timeout=30,
+        )
