@@ -76,7 +76,7 @@ Docker 部署提供 WebUI 进行管理配置，部署命令：
 ```shell
 docker run -d \
   --name quark-auto-save \
-  -p 5005:5005 \ # 映射端口，:前的可以改，即部署后访问的端口，:后的不可改
+  -p 127.0.0.1:5005:5005 \ # 仅绑定本机回环，避免公网直接访问
   -e WEBUI_USERNAME=admin \
   -e WEBUI_PASSWORD=admin123 \
   -v ./quark-auto-save/config:/app/config \ # 必须，配置持久化
@@ -97,7 +97,7 @@ services:
     container_name: quark-auto-save
     network_mode: bridge
     ports:
-      - 5005:5005
+      - 127.0.0.1:5005:5005
     restart: unless-stopped
     environment:
       WEBUI_USERNAME: "admin"
@@ -107,7 +107,7 @@ services:
       - ./quark-auto-save/media:/media
 ```
 
-管理地址：http://yourhost:5005
+管理地址：http://127.0.0.1:5005（建议经反向代理或 SSH 隧道访问）
 
 | 环境变量         | 默认       | 备注                                     |
 | ---------------- | ---------- | ---------------------------------------- |

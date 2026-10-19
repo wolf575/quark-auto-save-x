@@ -98,6 +98,7 @@ logging.basicConfig(
 if not DEBUG:
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     logging.getLogger("apscheduler").setLevel(logging.ERROR)
+    logging.getLogger("waitress").setLevel(logging.ERROR)
     sys.modules["flask.cli"].show_server_banner = lambda *x: None
 
 
@@ -651,8 +652,19 @@ if __name__ == "__main__":
     reload_tasks()
     logging.info(">>> 启动Web服务")
     logging.info(f"运行在: http://{HOST}:{PORT}")
-    app.run(
-        debug=DEBUG,
-        host=HOST,
-        port=PORT,
-    )
+    if os.environ.get("FLASK_DEV", "false").lower() == "true":
+        app.run(
+            debug=DEBUG,
+            host=HOST,
+            port=PORT,
+        )
+    else:
+        from waitress import serve
+
+        serve(
+            app,
+            host=HOST,
+            port=PORT,
+            threads=8,
+            channel_timeout=30,
+        )
