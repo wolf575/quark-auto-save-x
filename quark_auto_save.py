@@ -7350,6 +7350,17 @@ def main():
             tasklist_from_env = json.loads(tasklist_json)
         except Exception as e:
             print(f"从环境变量解析任务列表失败 {e}")
+    # 定时任务由 Web 端预计算当天到期任务后传入；与手动 TASKLIST 分开，
+    # 这样仍然保留所有账号的签到流程。
+    due_tasklist_from_env = None
+    if os.environ.get("DUE_TASKLIST_PRESENT") == "1":
+        try:
+            due_tasklist_from_env = json.loads(os.environ.get("DUE_TASKLIST", "[]"))
+            if not isinstance(due_tasklist_from_env, list):
+                raise ValueError("DUE_TASKLIST 必须是数组")
+        except Exception as e:
+            print(f"从环境变量解析当天任务列表失败 {e}")
+            due_tasklist_from_env = None
     # 检查本地文件是否存在，如果不存在就下载
     if not os.path.exists(config_path):
         if os.environ.get("QUARK_COOKIE"):
@@ -7407,7 +7418,17 @@ def main():
     if accounts[0].is_active and cookie_form_file:
         print(f"===============转存任务===============")
         # 任务列表
-        if tasklist_from_env:
+        if due_tasklist_from_env is not None:
+            if due_tasklist_from_env:
+                print(f"今日需要执行的任务数: {len(due_tasklist_from_env)}")
+                do_save(
+                    accounts[0],
+                    due_tasklist_from_env,
+                    ignore_execution_rules=False,
+                )
+            else:
+                print("今日没有需要执行的任务，跳过转存")
+        elif tasklist_from_env:
             # 若通过环境变量传入任务列表，视为手动运行，可由外层控制是否忽略执行周期/进度限制
             ignore_execution_rules = os.environ.get("IGNORE_EXECUTION_RULES", "").lower() in ["1", "true", "yes"]
             do_save(accounts[0], tasklist_from_env, ignore_execution_rules=ignore_execution_rules)

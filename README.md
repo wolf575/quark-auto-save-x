@@ -192,6 +192,8 @@ services:
 | `PLUGIN_FLAGS`   | 指定要禁用的插件，如 `-emby, -aria2, -alist_strm`（默认：全部启用） |
 | `PORT`           | 端口号（默认：5005）                 |
 | `DEBUG`          | 调试模式开关，`true` 或 `false`（默认：关闭）      |
+| `TASK_TIMEOUT`   | 单次定时任务硬超时秒数（默认：720）   |
+| `TASK_CYCLE_PREFLIGHT_MINUTES` | 首个任务前多少分钟刷新当天任务周期缓存（默认：5） |
 
 ### 访问 WebUI
 

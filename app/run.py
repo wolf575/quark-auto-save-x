@@ -36,9 +36,10 @@ import os
 import re
 import random
 import time
+import signal
 import treelib
 from functools import lru_cache
-from threading import Lock, Thread, Semaphore
+from threading import Lock, Thread, Semaphore, Timer
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
@@ -72,6 +73,20 @@ from sdk.trakt_service import TraktService
 from sdk.db import CalendarDB
 from sdk.db import RecordDB
 from utils.task_extractor import TaskExtractor
+try:
+    from task_cycle import (
+        cache_is_valid,
+        get_due_tasks,
+        read_task_cycle_cache,
+        refresh_task_cycle_cache,
+    )
+except ImportError:
+    from app.task_cycle import (
+        cache_is_valid,
+        get_due_tasks,
+        read_task_cycle_cache,
+        refresh_task_cycle_cache,
+    )
 
 
 def get_cloud_unarchive_timeout_seconds():
@@ -1053,6 +1068,18 @@ PLUGIN_FLAGS = os.environ.get("PLUGIN_FLAGS", "")
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 # 从环境变量获取端口，默认为5005
 PORT = int(os.environ.get("PORT", "5005"))
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+        return max(minimum, value)
+    except (TypeError, ValueError):
+        return default
+
+
+TASK_TIMEOUT = _env_int("TASK_TIMEOUT", 720)
+TASK_CYCLE_PREFLIGHT_MINUTES = _env_int("TASK_CYCLE_PREFLIGHT_MINUTES", 5, minimum=0)
 LOG_DIR = os.path.join(parent_dir, "config", "logs")
 LOG_FILE_PATH = os.path.join(LOG_DIR, "runtime.log")
 MAX_RUNTIME_LOG_LINES = 2000
@@ -2782,6 +2809,10 @@ def update():
         config_data['performance'].setdefault('backup_enabled', True)
         config_data['performance'].setdefault('backup_max_count', 4)
     Config.write_json(CONFIG_PATH, config_data)
+    try:
+        refresh_task_cycle_cache_now(force=True)
+    except Exception as exc:
+        logging.warning(f">>> 配置保存后任务周期预检失败: {exc}")
     # 更新session token，确保当前会话在用户名密码更改后仍然有效
     session["token"] = get_login_token()
     # 重新加载任务
@@ -4646,96 +4677,128 @@ def add_task():
     )
 
 
+def _kill_process_group(process):
+    """Kill the child and all of its descendants without touching the web app."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logging.warning(f">>> 终止任务子进程失败: {exc}")
+
+
 # 定时任务执行的函数
 def run_python(args):
     global _crontab_task_process
-    
-    logging.info(f">>> 开始执行定时运行全部任务")
-    
-    # 检查上一次任务是否还在运行，如果是则强制终止
+
+    logging.info(">>> 开始执行定时运行全部任务")
+
+    # 正常情况下 APScheduler 的 max_instances=1 会保护并发；这里作为兜底清理。
     if _crontab_task_process is not None:
         try:
-            # 检查进程是否还在运行（poll() 返回 None 表示还在运行，返回退出码表示已结束）
-            poll_result = _crontab_task_process.poll()
-            if poll_result is None:  # 进程还在运行
-                logging.warning(f">>> 检测到上一次定时运行全部任务仍在运行，正在强制终止...")
-                _crontab_task_process.kill()
+            if _crontab_task_process.poll() is None:
+                logging.warning(">>> 检测到上一次定时运行全部任务仍在运行，正在强制终止...")
+                _kill_process_group(_crontab_task_process)
                 _crontab_task_process.wait(timeout=10)
-                logging.warning(f">>> 已强制终止上一次定时运行全部任务")
-            else:  # 进程已结束（正常或异常退出）
-                logging.debug(f">>> 上一次定时运行全部任务已结束（退出码: {poll_result}）")
-        except ProcessLookupError:
-            # 进程不存在（可能已被系统清理）
-            logging.debug(f">>> 上一次定时运行全部任务进程已不存在/已自动清理")
-        except Exception as e:
-            logging.warning(f">>> 检查/终止上一次定时运行全部任务时出错: {e}")
+                logging.warning(">>> 已强制终止上一次定时运行全部任务")
+        except Exception as exc:
+            logging.warning(f">>> 清理上一次定时任务进程时出错: {exc}")
         finally:
-            # 无论什么情况，都清除进程对象，确保下次能正常运行
             _crontab_task_process = None
 
-    # 在定时任务开始前清理过期缓存
     try:
         cleaned_count = cleanup_expired_cache()
         if cleaned_count > 0:
             logging.info(f">>> 清理了 {cleaned_count} 个过期缓存项")
-    except Exception as e:
-        logging.warning(f">>> 清理缓存时出错: {e}")
+    except Exception as exc:
+        logging.warning(f">>> 清理缓存时出错: {exc}")
 
-    # 检查是否需要随机延迟执行
     if delay := config_data.get("crontab_delay"):
         try:
             delay_seconds = int(delay)
             if delay_seconds > 0:
-                # 在0到设定值之间随机选择一个延迟时间
                 random_delay = random.randint(0, delay_seconds)
                 logging.info(f">>> 随机延迟执行 {random_delay} 秒")
                 time.sleep(random_delay)
         except (ValueError, TypeError):
             logging.warning(f">>> 延迟执行设置无效: {delay}")
 
-    # 内部函数：执行一次任务
+    due_tasks = None
+    try:
+        due_tasks, cycle_cache = get_due_tasks(config_data, CONFIG_PATH)
+        logging.info(
+            ">>> 今日任务周期: %s/%s 个任务需要执行",
+            cycle_cache.get("due_count", 0),
+            cycle_cache.get("total", 0),
+        )
+        if due_tasks:
+            names = [str(task.get("taskname") or task.get("task_name") or "<unnamed>") for task in due_tasks]
+            logging.info(">>> 本轮执行任务: %s", "、".join(names))
+        else:
+            logging.info(">>> 今日没有需要转存的任务，仅执行账号签到")
+    except Exception as exc:
+        logging.warning(f">>> 任务周期缓存读取失败，回退到全量任务过滤: {exc}")
+        due_tasks = None
+
     def execute_task():
-        """执行一次定时任务，返回退出码"""
+        """执行一次定时任务，返回 (退出码, 是否超时)。"""
         global _crontab_task_process
-        
+
         process_env = os.environ.copy()
         process_env["PYTHONIOENCODING"] = "utf-8"
-        
-        # 构建命令
+        if due_tasks is not None:
+            process_env["DUE_TASKLIST_PRESENT"] = "1"
+            process_env["DUE_TASKLIST"] = json.dumps(due_tasks, ensure_ascii=False)
+        else:
+            process_env.pop("DUE_TASKLIST_PRESENT", None)
+            process_env.pop("DUE_TASKLIST", None)
+
         if isinstance(args, str):
             import shlex
             args_list = shlex.split(args)
             command = [PYTHON_PATH, "-u"] + args_list
         else:
             command = [PYTHON_PATH, "-u"] + list(args)
-        
-        # 启动进程并记录，实时输出日志
-        _crontab_task_process = subprocess.Popen(
-            command,
-            env=process_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,  # 行缓冲，确保实时输出
-        )
-        
-        # 实时读取输出并写入日志，保留完整日志功能
-        # 全局变量：跟踪上一次输出是否是空行
+
+        popen_kwargs = {
+            "env": process_env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "universal_newlines": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+
+        _crontab_task_process = subprocess.Popen(command, **popen_kwargs)
+        timeout_state = {"timed_out": False}
+
+        def on_timeout():
+            timeout_state["timed_out"] = True
+            logging.error(
+                ">>> 单次任务执行超过 %s 秒，强制终止整个子进程组",
+                TASK_TIMEOUT,
+            )
+            _kill_process_group(_crontab_task_process)
+
+        timer = Timer(TASK_TIMEOUT, on_timeout)
+        timer.daemon = True
+        timer.start()
+
         last_was_empty = False
-        
         try:
             for line in iter(_crontab_task_process.stdout.readline, ""):
                 stripped_line = line.rstrip()
-                # 检查是否是空行（去除换行符后是否为空）
                 is_empty = not stripped_line
-                
-                # 如果是空行且上一次也是空行，跳过本次输出
                 if is_empty and last_was_empty:
                     continue
-                
-                # 输出日志（空行也输出，但避免连续空行）
                 if is_empty:
                     logging.info("")
                     last_was_empty = True
@@ -4743,61 +4806,147 @@ def run_python(args):
                     _log_subprocess_line(stripped_line)
                     last_was_empty = False
         finally:
-            _crontab_task_process.stdout.close()
-        
-        # 等待进程完成并返回退出码
-        returncode = _crontab_task_process.wait()
-        return returncode
+            timer.cancel()
+            try:
+                _crontab_task_process.stdout.close()
+            except Exception:
+                pass
 
-    # 执行任务，支持重试机制
-    max_retries = 1  # 最多重试1次（即总共执行2次）
-    retry_count = 0
-    returncode = None
-    
-    try:
-        # 第一次执行
-        returncode = execute_task()
-        
-        if returncode == 0:
-            logging.info(f">>> 定时运行全部任务执行成功")
-        else:
-            logging.warning(f">>> 定时运行全部任务执行完成但返回非零退出码: {returncode}")
-            
-            # 如果返回非零退出码，进行重试
-            if retry_count < max_retries:
-                retry_count += 1
-                logging.warning(f">>> 检测到非零退出码，将在 5 秒后自动重试一次定时运行全部任务...")
-                time.sleep(5)  # 重试前等待5秒，避免立即重试
-                logging.info(f">>> 开始重试定时运行全部任务")
-                
-                # 重试执行
-                returncode = execute_task()
-                
-                if returncode == 0:
-                    logging.info(f">>> 定时运行全部任务重试成功")
-                else:
-                    logging.warning(f">>> 定时运行全部任务重试完成但返回非零退出码: {returncode}")
-        
-        # 定时任务执行完毕后，通知前端更新（包括已转存集数和当日更新标识）
-        # 注意：每个转存成功时已经通过 /api/calendar/metrics/sync_task 更新了数据库并发送了通知
-        # 这里只需要发送一个总体的完成通知，让前端知道定时任务已完成，可以统一刷新数据
         try:
-            notify_calendar_changed('crontab_task_completed')
-            logging.debug(f">>> 已通知前端更新已转存集数和当日更新标识（定时任务执行完毕）")
-        except Exception as e:
-            logging.warning(f">>> 通知前端更新已转存集数和当日更新标识失败: {e}")
-    except Exception as e:
-        logging.error(f">>> 定时运行全部任务执行异常: {str(e)}")
-        import traceback
-        logging.error(f">>> 异常堆栈: {traceback.format_exc()}")
+            returncode = _crontab_task_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(_crontab_task_process)
+            returncode = _crontab_task_process.wait()
+        return returncode, timeout_state["timed_out"]
+
+    max_retries = 1
+    returncode = None
+    timed_out = False
+
+    try:
+        returncode, timed_out = execute_task()
+        if timed_out:
+            logging.error(">>> 定时运行全部任务超时，已释放执行槽位，本轮不重试")
+        elif returncode == 0:
+            logging.info(">>> 定时运行全部任务执行成功")
+        else:
+            logging.warning(f">>> 定时运行全部任务返回非零退出码: {returncode}")
+            if max_retries > 0:
+                logging.warning(">>> 5 秒后自动重试一次定时运行全部任务...")
+                time.sleep(5)
+                returncode, timed_out = execute_task()
+                if timed_out:
+                    logging.error(">>> 重试超时，已释放执行槽位")
+                elif returncode == 0:
+                    logging.info(">>> 定时运行全部任务重试成功")
+                else:
+                    logging.warning(f">>> 重试后仍返回非零退出码: {returncode}")
+
+        try:
+            notify_calendar_changed("crontab_task_completed")
+        except Exception as exc:
+            logging.warning(f">>> 通知前端任务完成失败: {exc}")
+    except Exception as exc:
+        logging.error(f">>> 定时运行全部任务执行异常: {exc}", exc_info=True)
     finally:
-        # 每日首次定时任务执行后自动备份 config 目录下的 data.db 与 quark_config.json
         try:
             ensure_daily_backup_if_due(CONFIG_PATH, config_data)
         except Exception as backup_err:
             logging.warning(f">>> 自动备份异常: {backup_err}")
-        # 任务完成，清除进程对象
         _crontab_task_process = None
+
+
+def refresh_task_cycle_cache_now(force: bool = False):
+    """Refresh the tiny daily task cache without running any transfer task."""
+    started = time.monotonic()
+    cache = refresh_task_cycle_cache(
+        config_data,
+        CONFIG_PATH,
+        force=force,
+    )
+    elapsed = time.monotonic() - started
+    logging.info(
+        ">>> 今日任务周期缓存: %s/%s 个任务需要执行，耗时 %.3fs",
+        cache.get("due_count", 0),
+        cache.get("total", 0),
+        elapsed,
+    )
+    return cache
+
+
+def _first_cron_fire_on_date(trigger, target_date):
+    timezone = trigger.timezone
+    start = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone)
+    return trigger.get_next_fire_time(None, start)
+
+
+def run_task_cycle_preflight():
+    """Run shortly before the first scheduled task window."""
+    try:
+        cache = refresh_task_cycle_cache_now(force=False)
+        due_names = cache.get("due_names") or []
+        if due_names:
+            preview = "、".join(due_names[:8])
+            if len(due_names) > 8:
+                preview += f" 等 {len(due_names)} 个"
+            logging.info(f">>> 今日待执行任务: {preview}")
+        else:
+            logging.info(">>> 今日没有需要执行的任务")
+    except Exception as exc:
+        logging.error(f">>> 任务周期预检失败: {exc}", exc_info=True)
+    finally:
+        schedule_task_cycle_preflight()
+
+
+def schedule_task_cycle_preflight():
+    """Schedule one lightweight preflight before the next task window."""
+    try:
+        try:
+            scheduler.remove_job("task_cycle_preflight")
+        except Exception:
+            pass
+
+        crontab = config_data.get("crontab")
+        if not crontab:
+            return
+
+        trigger = CronTrigger.from_crontab(crontab)
+        now = datetime.now(trigger.timezone)
+        cached = read_task_cycle_cache(CONFIG_PATH)
+        valid_today = cache_is_valid(cached, config_data, today=now.date())
+        target_date = now.date() + timedelta(days=1 if valid_today else 0)
+
+        first_fire = None
+        for _ in range(31):
+            first_fire = _first_cron_fire_on_date(trigger, target_date)
+            if first_fire is not None:
+                break
+            target_date += timedelta(days=1)
+        if first_fire is None:
+            logging.warning(">>> 无法计算任务周期预检时间")
+            return
+
+        preflight_at = first_fire - timedelta(minutes=TASK_CYCLE_PREFLIGHT_MINUTES)
+        if preflight_at <= now:
+            preflight_at = now + timedelta(seconds=1)
+
+        scheduler.add_job(
+            run_task_cycle_preflight,
+            trigger=DateTrigger(run_date=preflight_at),
+            id="task_cycle_preflight",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        if scheduler.state == 0:
+            scheduler.start()
+        logging.info(
+            ">>> 任务周期预检已安排: %s（首个任务时间 %s）",
+            preflight_at.strftime("%Y-%m-%d %H:%M:%S"),
+            first_fire.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    except Exception as exc:
+        logging.warning(f">>> 安排任务周期预检失败: {exc}")
 
 
 # 重新加载任务
@@ -4857,6 +5006,10 @@ def reload_tasks():
         try:
             # 重新计算并注册所有节目/指定节目的“播出状态刷新任务”
             _trigger_airtime_reschedule('startup')
+        except Exception:
+            pass
+        try:
+            schedule_task_cycle_preflight()
         except Exception:
             pass
 
@@ -4977,6 +5130,11 @@ def init():
 
     # 更新配置
     Config.write_json(CONFIG_PATH, config_data)
+    logging.info(f">>> 单次任务硬超时: {TASK_TIMEOUT} 秒")
+    try:
+        refresh_task_cycle_cache_now(force=True)
+    except Exception as exc:
+        logging.warning(f">>> 启动时任务周期预检失败: {exc}")
 
 
 # 获取历史转存记录

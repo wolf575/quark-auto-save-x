@@ -22,6 +22,9 @@ ENV BUILD_TAG=$BUILD_TAG
 
 # 端口配置 (可通过 -e PORT=xxxx 修改，适用于桥接模式和host模式)
 ENV PORT=5005
+# 单次任务硬超时（秒）与当天任务周期预检提前量（分钟）
+ENV TASK_TIMEOUT=720
+ENV TASK_CYCLE_PREFLIGHT_MINUTES=5
 EXPOSE 5005
 
 # 运行应用程序
