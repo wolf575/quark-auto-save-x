@@ -1954,6 +1954,15 @@ class Quark:
 
         return file_list
 
+    def _safe_ls_dir(self, pdir_fid, **kwargs):
+        """Normalize ls_dir failures to an empty list so callers never iterate dict keys."""
+        result = self.ls_dir(pdir_fid, **kwargs)
+        if isinstance(result, list):
+            return result
+        error = result.get("error") if isinstance(result, dict) else "unknown error"
+        _get_logger().warning(f"获取目录列表失败，按空目录处理: {error}")
+        return []
+
     def _fix_folder_sizes(self, file_list):
         """
         修复文件夹大小显示问题
@@ -2966,7 +2975,7 @@ class Quark:
 
             # 获取当前目录的文件列表
             if hasattr(self, 'savepath_fid') and self.savepath_fid.get(savepath):
-                dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+                dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
             else:
                 return {}
 
@@ -4273,7 +4282,7 @@ class Quark:
             if not self.savepath_fid.get(savepath):
                 # 路径已存在，直接设置fid
                 self.savepath_fid[savepath] = self.get_fids([savepath])[0]["fid"]
-            dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+            dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
             dir_file_name_list = [item["file_name"] for item in dir_file_list]
             
             # 判断目录是否为空（只包含非目录文件）
@@ -4507,7 +4516,7 @@ class Quark:
                 else:
                     self.savepath_fid[savepath] = savepath_fids[0]["fid"]
             
-            dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+            dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
             rename_logs = []  # 全剧集分支共用：转存/解压后重命名与本地文件重命名的日志
             is_rename_count = 0  # 全分支共用，供最终 return (is_rename_count > 0, rename_logs)
 
@@ -4799,7 +4808,7 @@ class Quark:
                                     auto_extract_mode = task.get("auto_extract_archive", "disabled")
                                     if self._is_auto_extract_enabled(auto_extract_mode) and subdir_path and not is_auto_extracted_subdir:
                                         # 获取刚转存的文件列表（转存后可能有延迟，支持重试）
-                                        fresh_files = self.ls_dir(self.savepath_fid[savepath])
+                                        fresh_files = self._safe_ls_dir(self.savepath_fid[savepath])
                                         max_retries_ep = 3
                                         retry_delay_ep = 2
                                         
@@ -4821,7 +4830,7 @@ class Quark:
                                                 if not archive_file and max_retries_ep > 0:
                                                     for _ in range(max_retries_ep - 1):
                                                         time.sleep(retry_delay_ep)
-                                                        fresh_files = self.ls_dir(self.savepath_fid[savepath])
+                                                        fresh_files = self._safe_ls_dir(self.savepath_fid[savepath])
                                                         for f in fresh_files:
                                                             if f["file_name"] == saved_item["file_name"]:
                                                                 archive_file = f
@@ -4904,7 +4913,7 @@ class Quark:
                     # 重命名逻辑：自动解压子目录或保存成功后执行
                     if run_rename_block:
                         # 刷新目录列表以获取新保存的文件
-                        fresh_dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+                        fresh_dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
                         
                         # 创建一个映射来存储原始文件名到保存项的映射
                         original_name_to_item = {}
@@ -4993,7 +5002,7 @@ class Quark:
                         is_rename_count += renamed_count
                         
                         # 更新dir_file_list以包含新转存的文件
-                        dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+                        dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
                     else:
                         # print("没有需要保存的新文件")
                         pass
@@ -5073,7 +5082,7 @@ class Quark:
                             error_msg = rename_return.get("message", "未知错误")
                             
                             # 刷新目录列表，检查文件是否实际已重命名成功
-                            fresh_dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+                            fresh_dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
                             target_exists = any(df["file_name"] == new_name for df in fresh_dir_file_list)
                             
                             # 如果目标文件已存在，说明重命名已经成功或有同名文件
@@ -5101,7 +5110,7 @@ class Quark:
                 else:
                     # 检查目标文件是否已经存在且是我们想要重命名的结果
                     # 这可能是因为之前的操作已经成功，但API返回了错误
-                    fresh_dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+                    fresh_dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
                     if any(df["file_name"] == new_name and df["fid"] != dir_file["fid"] for df in fresh_dir_file_list):
                         # 真正存在同名文件
                         # 注释掉同名文件警告信息记录
@@ -5145,7 +5154,7 @@ class Quark:
                     self.savepath_fid[savepath] = savepath_fids[0]["fid"]
             
             # 获取目录中的文件列表
-            dir_file_list = self.ls_dir(self.savepath_fid[savepath])
+            dir_file_list = self._safe_ls_dir(self.savepath_fid[savepath])
             
             # 应用过滤词过滤（修复bug：为本地文件重命名添加过滤规则）
             if task.get("filterwords"):
@@ -5647,7 +5656,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                                 print(f"无法获取目录fid: {current_path}")
                                 return
                         
-                        current_dir_files = account.ls_dir(current_fid)
+                        current_dir_files = account._safe_ls_dir(current_fid)
                         
                         # 处理当前目录
                         if relative_path:
@@ -5776,7 +5785,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                             expected_renamed_files[old_name] = expected_new_name
 
                     # 获取文件列表，只添加重命名的文件
-                    fresh_dir_file_list = account.ls_dir(account.savepath_fid[savepath])
+                    fresh_dir_file_list = account._safe_ls_dir(account.savepath_fid[savepath])
 
                     # 检查是否是保持原目录结构模式
                     auto_extract_mode = task.get("auto_extract_archive", "disabled")
@@ -5796,7 +5805,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                         """递归获取子目录及其所有子目录中的文件"""
                         all_files = []
                         try:
-                            subdir_files = account.ls_dir(subdir_fid)
+                            subdir_files = account._safe_ls_dir(subdir_fid)
                             for subdir_file in subdir_files:
                                 if subdir_file.get("dir", False):
                                     # 递归处理子目录
@@ -5912,7 +5921,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                         """递归获取子目录及其所有子目录中的文件"""
                         all_files = []
                         try:
-                            subdir_files = account.ls_dir(subdir_fid)
+                            subdir_files = account._safe_ls_dir(subdir_fid)
                             for subdir_file in subdir_files:
                                 if subdir_file.get("dir", False):
                                     sub_subdir_path = f"{subdir_name}/{subdir_file['file_name']}"
@@ -6100,7 +6109,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                                 # 获取此目录下的文件，单独处理显示
                                 try:
                                     update_subdir_fid = account.savepath_fid[update_subdir_path]
-                                    update_subdir_files = account.ls_dir(update_subdir_fid)
+                                    update_subdir_files = account._safe_ls_dir(update_subdir_fid)
                                     
                                     # 如果目录存在但没有在文件树中，这可能是首次执行的情况
                                     # 添加一个虚拟目录节点到树中
@@ -6229,7 +6238,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                     """递归获取子目录及其所有子目录中的文件"""
                     all_files = []
                     try:
-                        subdir_files = account.ls_dir(subdir_fid)
+                        subdir_files = account._safe_ls_dir(subdir_fid)
                         for subdir_file in subdir_files:
                             if subdir_file.get("dir", False):
                                 # 递归处理子目录
@@ -6368,7 +6377,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                         def get_extracted_folder_contents(folder_fid, folder_name, relative_path=""):
                             """递归获取解压文件夹内的所有文件和子目录"""
                             try:
-                                folder_contents = account.ls_dir(folder_fid)
+                                folder_contents = account._safe_ls_dir(folder_fid)
                                 files = []
                                 dirs = []
                                 
@@ -6618,7 +6627,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                                 """递归获取子目录及其所有子目录中的文件"""
                                 all_files = []
                                 try:
-                                    subdir_files = account.ls_dir(subdir_fid)
+                                    subdir_files = account._safe_ls_dir(subdir_fid)
                                     for subdir_file in subdir_files:
                                         if subdir_file.get("dir", False):
                                             sub_subdir_path = f"{subdir_name}/{subdir_file['file_name']}"
@@ -6716,7 +6725,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                     
                     # 获取保存路径下的所有目录
                     try:
-                        all_dirs = account.ls_dir(account.savepath_fid[savepath])
+                        all_dirs = account._safe_ls_dir(account.savepath_fid[savepath])
                         
                         # 筛选出符合更新规则的目录
                         for dir_item in all_dirs:
@@ -6730,7 +6739,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                                         if update_subdir_path in account.savepath_fid:
                                             try:
                                                 update_subdir_fid = account.savepath_fid[update_subdir_path]
-                                                update_subdir_files = account.ls_dir(update_subdir_fid)
+                                                update_subdir_files = account._safe_ls_dir(update_subdir_fid)
                                                 
                                                 # 创建虚拟目录节点
                                                 class VirtualDirNode:
@@ -7001,7 +7010,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
             elif is_rename and task.get("use_episode_naming") and task.get("episode_naming"):
                 # 重新获取文件列表
                 savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}")
-                dir_file_list = account.ls_dir(account.savepath_fid[savepath])
+                dir_file_list = account._safe_ls_dir(account.savepath_fid[savepath])
 
                 # 过滤出非目录的文件
                 file_nodes = [f for f in dir_file_list if not f["dir"]]
@@ -7205,7 +7214,7 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
             elif is_rename and not is_special_sequence and task.get("pattern") is not None:
                 # 重新获取文件列表
                 savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}")
-                dir_file_list = account.ls_dir(account.savepath_fid[savepath])
+                dir_file_list = account._safe_ls_dir(account.savepath_fid[savepath])
 
                 # 过滤出非目录的文件
                 file_nodes = [f for f in dir_file_list if not f["dir"]]

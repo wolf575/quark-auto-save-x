@@ -4746,7 +4746,7 @@ def run_python(args):
         due_tasks = None
 
     def execute_task():
-        """执行一次定时任务，返回 (退出码, 是否超时)。"""
+        """执行一次定时任务，返回 (退出码, 是否超时, 是否有未处理异常堆栈)。"""
         global _crontab_task_process
 
         process_env = os.environ.copy()
@@ -4778,7 +4778,7 @@ def run_python(args):
             popen_kwargs["start_new_session"] = True
 
         _crontab_task_process = subprocess.Popen(command, **popen_kwargs)
-        timeout_state = {"timed_out": False}
+        timeout_state = {"timed_out": False, "fatal_error": False}
 
         def on_timeout():
             timeout_state["timed_out"] = True
@@ -4804,6 +4804,8 @@ def run_python(args):
                     last_was_empty = True
                 else:
                     _log_subprocess_line(stripped_line)
+                    if "Traceback (most recent call last)" in stripped_line:
+                        timeout_state["fatal_error"] = True
                     last_was_empty = False
         finally:
             timer.cancel()
@@ -4817,16 +4819,19 @@ def run_python(args):
         except subprocess.TimeoutExpired:
             _kill_process_group(_crontab_task_process)
             returncode = _crontab_task_process.wait()
-        return returncode, timeout_state["timed_out"]
+        return returncode, timeout_state["timed_out"], timeout_state["fatal_error"]
 
     max_retries = 1
     returncode = None
     timed_out = False
+    fatal_error = False
 
     try:
-        returncode, timed_out = execute_task()
+        returncode, timed_out, fatal_error = execute_task()
         if timed_out:
             logging.error(">>> 定时运行全部任务超时，已释放执行槽位，本轮不重试")
+        elif fatal_error:
+            logging.error(">>> 检测到未处理异常堆栈，本轮不自动重试，避免掩盖真实错误")
         elif returncode == 0:
             logging.info(">>> 定时运行全部任务执行成功")
         else:
@@ -4834,9 +4839,11 @@ def run_python(args):
             if max_retries > 0:
                 logging.warning(">>> 5 秒后自动重试一次定时运行全部任务...")
                 time.sleep(5)
-                returncode, timed_out = execute_task()
+                returncode, timed_out, fatal_error = execute_task()
                 if timed_out:
                     logging.error(">>> 重试超时，已释放执行槽位")
+                elif fatal_error:
+                    logging.error(">>> 重试仍出现未处理异常堆栈，已停止自动重试")
                 elif returncode == 0:
                     logging.info(">>> 定时运行全部任务重试成功")
                 else:
