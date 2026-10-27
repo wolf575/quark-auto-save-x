@@ -1134,7 +1134,8 @@
                      @mousedown="runtimeLogUserInteracting = true"
                      @mouseup="runtimeLogUserInteracting = false"
                      @selectstart="runtimeLogUserInteracting = true"
-                     @copy="runtimeLogUserInteracting = false">
+                     @copy="runtimeLogUserInteracting = false"
+                     @scroll="handleRuntimeLogScroll">
                   <div v-if="!runtimeLogLoading && filteredRuntimeLogs.length === 0" style="display: flex; align-items: center; justify-content: center; min-height: 200px; color: var(--light-text-color);">
                     暂无匹配的日志
                   </div>
@@ -3480,6 +3481,7 @@
         runtimeLogPollingTimer: null,
         runtimeLogInitialized: false, // 跟踪运行日志是否已初始化（用于避免首次加载时的闪现）
         runtimeLogUserInteracting: false, // 用户正在选择/复制日志时暂停自动刷新和滚动校正
+        runtimeLogAutoFollow: true, // 仅在用户停留在底部时跟随最新日志
         taskDirs: [""],
         taskDirSelected: "",
         taskNameFilter: "",
@@ -4747,6 +4749,7 @@
         },
         activeTab(newValue, oldValue) {
           if (newValue === 'runlogs') {
+            this.runtimeLogAutoFollow = true;
             // 如果已经有日志，立即显示并滚动到底部，避免空白
             const hasLogs = Array.isArray(this.runtimeLogs) && this.runtimeLogs.length > 0;
             if (hasLogs && !this.runtimeLogInitialized) {
@@ -4754,7 +4757,7 @@
               this.$nextTick(() => {
                 const viewport = this.$refs.runtimeLogViewport;
                 if (viewport) {
-                  viewport.scrollTop = viewport.scrollHeight;
+                  viewport.scrollTop = window.innerWidth <= 768 ? 0 : viewport.scrollHeight;
                 }
               });
             }
@@ -11524,6 +11527,19 @@
           
           return blocks;
         },
+        handleRuntimeLogScroll() {
+          const viewport = this.$refs.runtimeLogViewport;
+          if (!viewport) return;
+          const isMobile = window.innerWidth <= 768;
+          const distanceFromFollowEdge = isMobile
+            ? viewport.scrollTop
+            : viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+          const wasFollowing = this.runtimeLogAutoFollow;
+          this.runtimeLogAutoFollow = distanceFromFollowEdge < 40;
+          if (!wasFollowing && this.runtimeLogAutoFollow) {
+            this.fetchRuntimeLogs(false);
+          }
+        },
         isRuntimeLogSelectionActive() {
           const viewport = this.$refs.runtimeLogViewport;
           if (!viewport || typeof window === 'undefined' || !window.getSelection) {
@@ -11545,6 +11561,10 @@
           if (this.runtimeLogUserInteracting || this.isRuntimeLogSelectionActive()) {
             return;
           }
+          // 用户向上查看历史日志时停止拉取，避免新日志插入把视口反复拖走
+          if (!force && !this.runtimeLogAutoFollow && this.runtimeLogs.length > 0) {
+            return;
+          }
           const hasLogs = Array.isArray(this.runtimeLogs) && this.runtimeLogs.length > 0;
           const shouldShowLoading = force || (!hasLogs && !this.runtimeLogLoading);
           const isInitialLoad = force && !hasLogs; // 判断是否是首次加载（强制刷新且没有现有日志）
@@ -11564,15 +11584,9 @@
           // 记录刷新前的滚动位置和内容高度
           const viewport = this.$refs.runtimeLogViewport;
           let previousScrollTop = 0;
-          let previousScrollHeight = 0;
-          let wasNearBottom = false;
           
           if (viewport) {
             previousScrollTop = viewport.scrollTop;
-            previousScrollHeight = viewport.scrollHeight;
-            // 判断用户是否接近底部（距离底部小于50像素视为接近底部）
-            const distanceFromBottom = previousScrollHeight - previousScrollTop - viewport.clientHeight;
-            wasNearBottom = distanceFromBottom < 50;
           }
           
           // 获取运行日志显示范围配置（天数），默认1天
@@ -11586,9 +11600,9 @@
                 this.$nextTick(() => {
                   const viewport = this.$refs.runtimeLogViewport;
                   if (viewport) {
-                    if (isInitialLoad || wasNearBottom) {
+                    if (isInitialLoad || this.runtimeLogAutoFollow) {
                       // 首次加载或用户接近底部时，滚动到底部（保持自动跟随最新日志）
-                      viewport.scrollTop = viewport.scrollHeight;
+                      viewport.scrollTop = window.innerWidth <= 768 ? 0 : viewport.scrollHeight;
                       // 首次加载时，滚动完成后再显示内容，避免闪现
                       if (isInitialLoad) {
                         // 使用 requestAnimationFrame 确保滚动完成后再显示
@@ -11599,10 +11613,8 @@
                         });
                       }
                     } else {
-                      // 否则保持用户的滚动位置
-                      const newScrollHeight = viewport.scrollHeight;
-                      const heightDiff = newScrollHeight - previousScrollHeight;
-                      viewport.scrollTop = previousScrollTop + heightDiff;
+                      // 强制刷新时也只恢复原来的位置，不做高度差校正
+                      viewport.scrollTop = previousScrollTop;
                     }
                     // 确保如果不是首次加载，日志是显示的
                     if (!isInitialLoad && !this.runtimeLogInitialized) {

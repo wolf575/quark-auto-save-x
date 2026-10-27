@@ -194,6 +194,7 @@ services:
 | `DEBUG`          | 调试模式开关，`true` 或 `false`（默认：关闭）      |
 | `TASK_TIMEOUT`   | 单次定时任务硬超时秒数（默认：720）   |
 | `TASK_CYCLE_PREFLIGHT_MINUTES` | 首个任务前多少分钟刷新当天任务周期缓存（默认：5） |
+| `TASK_WORKERS`   | 并行预检和任务组执行线程数（默认：4） |
 
 ### 访问 WebUI
 

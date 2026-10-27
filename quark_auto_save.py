@@ -11,12 +11,15 @@ import sys
 import json
 import time
 import random
+import copy
 import logging
 import requests
 import importlib
 import urllib.parse
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from threading import Lock, local
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 添加数据库导入
 try:
@@ -1019,6 +1022,23 @@ COOKIE_PATH = "quark_cookie.txt"
 CONFIG_DATA = {}
 LOG_LIST = []
 NOTIFYS = []
+_NOTIFY_CONTEXT = local()
+_PLUGIN_CONFIG_LOCK = Lock()
+
+
+def _get_notify_buffer():
+    return getattr(_NOTIFY_CONTEXT, "buffer", NOTIFYS)
+
+
+def _set_notify_buffer(buffer):
+    _NOTIFY_CONTEXT.buffer = buffer
+
+
+def _clear_notify_buffer():
+    try:
+        del _NOTIFY_CONTEXT.buffer
+    except AttributeError:
+        pass
 
 def is_date_format(number_str):
     """
@@ -1156,12 +1176,12 @@ def send_ql_notify(title, body):
 
 # 添加消息
 def add_notify(text):
-    global NOTIFYS
+    notify_buffer = _get_notify_buffer()
     # 防止重复添加相同的通知
     # 但是对于文件树显示，允许相同文本（因为可能是不同目录下的同名文件）
     # 通过检查文本是否包含文件树前缀（├── 或 └──）来判断
     is_file_tree_line = "├── " in text or "└── " in text
-    if text in NOTIFYS and not is_file_tree_line:
+    if text in notify_buffer and not is_file_tree_line:
         return text
     
     # 检查推送通知类型配置
@@ -1192,11 +1212,11 @@ def add_notify(text):
     is_success_block = text.startswith("✅《")
     is_failure_block = text.startswith("❌") or text.startswith("❗") or any(k in text for k in failure_keywords if k not in ["✅"])
     if is_success_block or is_failure_block:
-        if NOTIFYS and NOTIFYS[-1] != "":
-            NOTIFYS.append("")
+        if notify_buffer and notify_buffer[-1] != "":
+            notify_buffer.append("")
             # 仅在通知体中添加空行，不额外打印控制台空行
     
-    NOTIFYS.append(text)
+    notify_buffer.append(text)
     print(text)
     return text
 
@@ -3069,7 +3089,7 @@ class Quark:
             print(f"检查文件记录时出错: {e}")
             return False
 
-    def do_save_task(self, task):
+    def do_save_task(self, task, probe_only=False):
         # 每轮任务重置：更新目录下「转存轮询仅提示一次」（实例级，子任务 copy 不影响）
         self._transfer_poll_ui_done = False
         task.pop("_transfer_poll_progress_shown", None)  # 兼容旧版写在 task 上的键
@@ -3178,7 +3198,7 @@ class Quark:
             #     print(f"正则替换: {replace}")
             
         # 保存文件
-        tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid)
+        tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid, probe_only=probe_only)
         
         # 检查是否有新文件转存
         if tree and tree.size() <= 1:  # 只有根节点意味着没有新文件
@@ -3186,7 +3206,7 @@ class Quark:
             
         return tree
 
-    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path="", parent_dir_info=None):
+    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path="", parent_dir_info=None, probe_only=False):
         tree = Tree()
         # 获取分享文件列表
         share_file_list = self.get_detail(pwd_id, stoken, pdir_fid)["list"]
@@ -3457,7 +3477,8 @@ class Quark:
                             stoken,
                             share_file["fid"],
                             f"{subdir_path}/{share_file['file_name']}",
-                            current_parent_info
+                            current_parent_info,
+                            probe_only=probe_only,
                         )
                         # 使用 size()>1 判断子树是否有实质节点（size(1) 仅为第一层计数，易误判）
                         # 递归转存已完成时不要把文件夹 fid 再次加入 need_save_list，否则会多出空目录壳或与递归写入冲突
@@ -3677,6 +3698,7 @@ class Quark:
                             share_file["fid"],
                             f"{subdir_path}/{share_file['file_name']}",
                             current_parent_info,
+                            probe_only=probe_only,
                         )
                         if subdir_tree and subdir_tree.size() > 1:
                             has_files = False
@@ -3845,6 +3867,7 @@ class Quark:
                         share_file["fid"],
                         f"{subdir_path}/{share_file['file_name']}",
                         current_parent_info,
+                        probe_only=probe_only,
                     )
                     if subdir_tree and subdir_tree.size() > 1:
                         has_files = False
@@ -3981,7 +4004,8 @@ class Quark:
                                     stoken,
                                     share_file["fid"],
                                     f"{subdir_path}/{share_file['file_name']}",
-                                    current_parent_info
+                                    current_parent_info,
+                                    probe_only=probe_only,
                                 )
                                 
                                 # 只有当子目录树有实际内容（大于1表示不只有根节点）时才处理
@@ -4096,6 +4120,9 @@ class Quark:
             fid_token_list = [item["share_fid_token"] for item in need_save_list]
         
         if fid_list:
+            if probe_only:
+                task["_probe_has_updates"] = True
+                return tree
             # 只在有新文件需要转存时才处理
             save_file_return = self.save_file(
                 fid_list, fid_token_list, to_pdir_fid, pwd_id, stoken
@@ -5452,11 +5479,12 @@ def do_sign(account):
     print()
 
 
-def do_save(account, tasklist=[], ignore_execution_rules=False):
+def do_save(account, tasklist=[], ignore_execution_rules=False, stop_after_first_result=False):
     print(f"🧩 载入插件")
-    plugins, CONFIG_DATA["plugins"], task_plugins_config = Config.load_plugins(
-        CONFIG_DATA.get("plugins", {})
-    )
+    with _PLUGIN_CONFIG_LOCK:
+        plugins, CONFIG_DATA["plugins"], task_plugins_config = Config.load_plugins(
+            CONFIG_DATA.get("plugins", {})
+        )
     print(f"转存账号: {account.nickname}")
     # 获取全部保存目录fid
     account.update_savepath_fid(tasklist)
@@ -5513,7 +5541,12 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
     # 执行任务
     for index, task in enumerate(tasklist):
         # 检查环境变量获取真实的任务索引（用于显示）
-        if len(tasklist) == 1 and os.environ.get("ORIGINAL_TASK_INDEX"):
+        if task.get("_original_index") is not None:
+            try:
+                display_index = int(task["_original_index"]) + 1
+            except (TypeError, ValueError):
+                display_index = index + 1
+        elif len(tasklist) == 1 and os.environ.get("ORIGINAL_TASK_INDEX"):
             try:
                 display_index = int(os.environ.get("ORIGINAL_TASK_INDEX"))
             except (ValueError, TypeError):
@@ -5610,10 +5643,6 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                 # 按自选周期执行时的跳过提示（原有逻辑）
                 print(f"任务不在执行周期内，跳过")
         else:
-            # 保存之前的通知信息
-            global NOTIFYS
-            notifys_before = NOTIFYS.copy()
-            
             # 将全局的自动解压设置添加到任务中
             # 任务级明确为 disabled 时保持禁用；任务级为空或无效时继承全局设置
             task_settings = CONFIG_DATA.get("task_settings", {})
@@ -7268,7 +7297,8 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                 
                 # 控制台视觉分隔：若前面未通过 add_notify("") 打印过空行，则补打一行空行
                 try:
-                    if not (NOTIFYS and NOTIFYS[-1] == ""):
+                    notify_buffer = _get_notify_buffer()
+                    if not (notify_buffer and notify_buffer[-1] == ""):
                         print()
                 except Exception:
                     # 兜底：若 NOTIFYS 异常，仍保证有一行空行
@@ -7341,7 +7371,202 @@ def do_save(account, tasklist=[], ignore_execution_rules=False):
                         )
             elif is_new_tree is False:  # 明确没有新文件
                 print(f"任务完成: 没有新的文件需要转存")
+            if stop_after_first_result and (is_new_tree or is_rename):
+                return {
+                    "success": True,
+                    "task_index": task.get("_original_index", index),
+                    "task_name": task.get("taskname") or task.get("task_name") or "",
+                    "is_new_tree": bool(is_new_tree),
+                    "is_rename": bool(is_rename),
+                }
     print()
+
+
+def _task_worker_count(task_count):
+    try:
+        configured = int(os.environ.get("TASK_WORKERS", "4"))
+    except (TypeError, ValueError):
+        configured = 4
+    return max(1, min(configured, max(1, task_count)))
+
+
+def _task_group_name(task):
+    return str(task.get("taskname") or task.get("task_name") or "").strip() or "__unnamed__"
+
+
+def _build_task_groups(tasklist):
+    groups = []
+    group_by_name = {}
+    for original_index, task in enumerate(tasklist):
+        name = _task_group_name(task)
+        if name not in group_by_name:
+            group_by_name[name] = len(groups)
+            groups.append({"name": name, "tasks": []})
+        groups[group_by_name[name]]["tasks"].append((original_index, task))
+    return groups
+
+
+def _probe_one_task(account, original_index, task):
+    probe_task = copy.deepcopy(task)
+    probe_task["_original_index"] = original_index
+    probe_task.pop("_probe_has_updates", None)
+    local_account = Quark(account.cookie, account.index - 1)
+    buffer = []
+    _set_notify_buffer(buffer)
+    try:
+        tree = local_account.do_save_task(probe_task, probe_only=True)
+        has_updates = bool(probe_task.get("_probe_has_updates")) or bool(
+            tree and tree.size() > 1
+        )
+        return {
+            "index": original_index,
+            "task": task,
+            "success": has_updates,
+            "notify_lines": list(buffer),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "index": original_index,
+            "task": task,
+            "success": False,
+            "notify_lines": list(buffer),
+            "error": str(exc),
+        }
+    finally:
+        _clear_notify_buffer()
+
+
+def _execute_task_group(account, group_name, candidates):
+    """Execute the first successful candidate in original task order."""
+    local_account = Quark(account.cookie, account.index - 1)
+    first_failure_lines = []
+
+    for candidate in candidates:
+        task = copy.deepcopy(candidate["task"])
+        task["_original_index"] = candidate["index"]
+        buffer = []
+        _set_notify_buffer(buffer)
+        try:
+            result = do_save(
+                local_account,
+                [task],
+                ignore_execution_rules=False,
+                stop_after_first_result=True,
+            )
+            lines = list(buffer)
+            if result and result.get("success"):
+                return {
+                    "group_name": group_name,
+                    "success": True,
+                    "task_index": candidate["index"],
+                    "notify_lines": lines,
+                    "error": None,
+                }
+            if not first_failure_lines and lines:
+                first_failure_lines = lines
+        except Exception as exc:
+            # 探测成功后执行阶段若异常，可能已经发生了部分转存；不要冒险再执行下一个候选。
+            return {
+                "group_name": group_name,
+                "success": False,
+                "task_index": candidate["index"],
+                "notify_lines": first_failure_lines or [f"❌《{group_name}》任务执行异常: {exc}\n"],
+                "error": str(exc),
+            }
+        finally:
+            _clear_notify_buffer()
+
+    return {
+        "group_name": group_name,
+        "success": False,
+        "task_index": None,
+        "notify_lines": first_failure_lines,
+        "error": None,
+    }
+
+
+def do_save_parallel(account, tasklist):
+    """Probe all tasks in parallel, then transfer only the first result per task-name group."""
+    if not tasklist:
+        return []
+
+    groups = _build_task_groups(tasklist)
+    print(f"[并行] 任务预检: {len(tasklist)} 个任务，{len(groups)} 个任务组")
+
+    # 先串行准备所有保存目录，避免同名任务并发探测时同时 mkdir 同一个目录。
+    try:
+        bootstrap_account = Quark(account.cookie, account.index - 1)
+        bootstrap_account.update_savepath_fid(tasklist)
+    except Exception as exc:
+        print(f"[警告] 并行预检准备保存目录失败: {exc}")
+
+    probe_results = []
+    with ThreadPoolExecutor(max_workers=_task_worker_count(len(tasklist))) as executor:
+        futures = {
+            executor.submit(_probe_one_task, account, index, task): index
+            for index, task in enumerate(tasklist)
+        }
+        for future in as_completed(futures):
+            probe_results.append(future.result())
+    probe_results.sort(key=lambda item: item["index"])
+    probe_by_index = {item["index"]: item for item in probe_results}
+
+    plans = []
+    for group in groups:
+        candidates = [
+            probe_by_index[index]
+            for index, _task in group["tasks"]
+            if probe_by_index.get(index, {}).get("success")
+        ]
+        candidates.sort(key=lambda item: item["index"])
+        failure_lines = []
+        for index, _task in group["tasks"]:
+            result = probe_by_index.get(index)
+            if result and result.get("notify_lines"):
+                failure_lines = result["notify_lines"]
+                break
+        plans.append({
+            "group_name": group["name"],
+            "candidates": candidates,
+            "failure_lines": failure_lines,
+        })
+
+    successful_groups = sum(1 for plan in plans if plan["candidates"])
+    print(f"[并行] 预检完成: {successful_groups}/{len(plans)} 个任务组有可转存结果")
+
+    execution_results = {}
+    with ThreadPoolExecutor(max_workers=_task_worker_count(len(plans))) as executor:
+        futures = {
+            executor.submit(
+                _execute_task_group,
+                account,
+                plan["group_name"],
+                plan["candidates"],
+            ): plan_index
+            for plan_index, plan in enumerate(plans)
+            if plan["candidates"]
+        }
+        for future in as_completed(futures):
+            execution_results[futures[future]] = future.result()
+
+    final_results = []
+    for plan_index, plan in enumerate(plans):
+        result = execution_results.get(plan_index)
+        lines = result.get("notify_lines") if result else plan["failure_lines"]
+        if lines:
+            for line in lines:
+                if line == "" and NOTIFYS and NOTIFYS[-1] == "":
+                    continue
+                NOTIFYS.append(line)
+        final_results.append(result or {
+            "group_name": plan["group_name"],
+            "success": False,
+            "task_index": None,
+            "notify_lines": plan["failure_lines"],
+            "error": None,
+        })
+    return final_results
 
 
 def main():
@@ -7430,11 +7655,7 @@ def main():
         if due_tasklist_from_env is not None:
             if due_tasklist_from_env:
                 print(f"今日需要执行的任务数: {len(due_tasklist_from_env)}")
-                do_save(
-                    accounts[0],
-                    due_tasklist_from_env,
-                    ignore_execution_rules=False,
-                )
+                do_save_parallel(accounts[0], due_tasklist_from_env)
             else:
                 print("今日没有需要执行的任务，跳过转存")
         elif tasklist_from_env:
@@ -7443,7 +7664,7 @@ def main():
             do_save(accounts[0], tasklist_from_env, ignore_execution_rules=ignore_execution_rules)
         else:
             # 定时任务或命令行全量运行，始终遵循执行周期/进度规则
-            do_save(accounts[0], CONFIG_DATA.get("tasklist", []), ignore_execution_rules=False)
+            do_save_parallel(accounts[0], CONFIG_DATA.get("tasklist", []))
         print()
     # 通知
     if NOTIFYS:
